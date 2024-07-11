@@ -1,0 +1,4 @@
+reference/
+data/
+*.ipynb
+__pycache__/
