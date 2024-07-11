@@ -1,6 +1,7 @@
 import torch
 import requests
 from models.gpt import get_gpt
+
 from models.mamba import get_mambalm
 from args import get_args
 
@@ -21,7 +22,7 @@ class ShakespeareDataset:
         self.char_to_idx = {ch: i for i, ch in enumerate(self.chars)}
         self.idx_to_char = {i: ch for i, ch in enumerate(self.chars)}
         self.vocab_size = len(self.chars)
-        self.self.block_size = block_size
+        self.block_size = block_size
         self.create_dataset()
 
     def create_dataset(self):
@@ -63,7 +64,7 @@ def evaluate(model, dataset, batch_size, num_steps):
         for _ in range(num_steps):
             x, y = dataset.get_batch("valid", batch_size)
             x, y = x.to(device), y.to(device)
-            logits, loss = model(x)
+            logits, loss = model(x, y)
             total_loss += loss.item()
             iters += 1
     return total_loss / iters
@@ -72,16 +73,20 @@ def evaluate(model, dataset, batch_size, num_steps):
 def train(model, dataset, num_steps, batch_size, learning_rate, weight_decay, eval_interval=500, eval_steps=200):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.train()
+    model = model.to(device)
     num_params = sum(p.numel() for p in model.parameters())
     print(f"Number of parameters: {num_params}")
     optim = configure_optimizers(model, weight_decay, learning_rate)
-
+    losses = []
+    initial_loss = evaluate(model, dataset, batch_size, 1)
+    expected = -torch.log(torch.tensor(1.0 / dataset.vocab_size)).item()
+    print(f"Initial validation loss: {initial_loss}, expected {expected}")
     for step in range(num_steps):
         x, y = dataset.get_batch("train", batch_size)
         x, y = x.to(device), y.to(device)
-
-        logits, loss = model(x)
-
+        with torch.autocast(device=device, dtype=torch.bfloat16):
+            logits, loss = model(x, y)
+        losses.append(loss.item())
         optim.zero_grad()
         loss.backward()
         optim.step()
@@ -89,6 +94,10 @@ def train(model, dataset, num_steps, batch_size, learning_rate, weight_decay, ev
         if step % eval_interval == 0:
             eval_loss = evaluate(model, dataset, batch_size, eval_steps)  # 200 batches for evaluation
             print(f"Step {step}, Loss {loss.item()}, Eval Loss {eval_loss}")
+
+    with open(f"{model.config.model_type}_losses.txt", "w") as f:
+        for loss in losses:
+            f.write(f"{loss}\n")
 
 
 if __name__ == "__main__":

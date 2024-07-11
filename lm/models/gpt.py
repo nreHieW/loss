@@ -4,6 +4,20 @@ from torch.nn import functional as F
 from dataclasses import dataclass
 
 
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def _norm(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+
+    def forward(self, x):
+        output = self._norm(x.float()).type_as(x)
+        return output * self.weight
+
+
 # https://github.com/karpathy/build-nanogpt/blob/master/train_gpt2.py
 class CausalSelfAttention(nn.Module):
     def __init__(self, config):
@@ -31,29 +45,28 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
-        self.gelu = nn.GELU(approximate="tanh")
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
-        self.c_proj.SCALE_INIT = 1
+        self.gate_proj = nn.Linear(config.n_embd, 4 * config.n_embd)
+        self.up_proj = nn.Linear(config.n_embd, 4 * config.n_embd)
+        self.down_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+        self.down_proj.SCALE_INIT = 1
 
     def forward(self, x):
-        x = self.c_fc(x)
-        x = self.gelu(x)
-        x = self.c_proj(x)
-        return x
+        gate = F.silu(self.gate_proj(x))
+        fused = gate * self.up_proj(x)
+        return self.down_proj(fused)
 
 
 class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.ln_1 = nn.LayerNorm(config.n_embd)
+        self.norm_1 = RMSNorm(config.n_embd)
         self.attn = CausalSelfAttention(config)
-        self.ln_2 = nn.LayerNorm(config.n_embd)
+        self.norm_2 = RMSNorm(config.n_embd)
         self.mlp = MLP(config)
 
     def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
+        x = x + self.attn(self.norm_1(x))
+        x = x + self.mlp(self.norm_2(x))
         return x
 
 
@@ -63,7 +76,7 @@ class GPT(nn.Module):
         self.tok_emb = nn.Embedding(config.vocab_size, config.n_embd)
         self.pos_emb = nn.Embedding(config.block_size, config.n_embd)
         self.blocks = nn.Sequential(*[Block(config) for _ in range(config.n_layer)])
-        self.ln_f = nn.LayerNorm(config.n_embd)
+        self.norm_f = RMSNorm(config.n_embd)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
         self.tok_emb.weight = self.lm_head.weight
@@ -91,7 +104,7 @@ class GPT(nn.Module):
 
         x = self.blocks(x)
 
-        x = self.ln_f(x)
+        x = self.norm_f(x)
         logits = self.lm_head(x)
         loss = None
         if targets is not None:
