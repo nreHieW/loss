@@ -1,11 +1,15 @@
 import torch
 import requests
 from models.gpt import get_gpt
+from models.mamba import get_mambalm
+from args import get_args
 
 
 def get_model(model_name: str, block_size, vocab_size, n_layer, n_head, n_embd):
     if model_name == "gpt":
         return get_gpt(block_size, vocab_size, n_layer, n_head, n_embd)
+    elif model_name == "mamba":
+        return get_mambalm(block_size, vocab_size, n_layer, n_embd)
 
 
 class ShakespeareDataset:
@@ -88,7 +92,8 @@ def train(model, dataset, num_steps, batch_size, learning_rate, weight_decay, ev
 
 
 if __name__ == "__main__":
-    dataset = ShakespeareDataset(block_size=128)
-    model = get_model("gpt", block_size=128, vocab_size=dataset.vocab_size, n_layer=2, n_head=4, n_embd=128)
-    train(model, dataset, num_steps=10000, batch_size=16, learning_rate=0.0005, weight_decay=0.0)
-    torch.save(model.state_dict(), "model.pth")
+    args = get_args()
+    dataset = ShakespeareDataset(block_size=args.block_size)
+    model = get_model(args.model_type, args.block_size, dataset.vocab_size, args.n_layer, args.n_head, args.n_embd)
+    train(model, dataset, args.num_steps, args.batch_size, args.learning_rate, args.weight_decay)
+    torch.save(model.state_dict(), f"{args.model_type}_model.pt")
