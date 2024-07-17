@@ -6,15 +6,57 @@ import argparse
 import copy
 import numpy as np
 import h5py
+from tqdm import tqdm
 from torch.utils.data import DataLoader
 from typing import Tuple, Dict
 
+try:
+    from models.vision_mamba import VisionMamba
+except ImportError:
+    pass
 
-from reference.ref_resnet import load_ref
+
+from models.resnet import ResNet
+from models.vit import ViT
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "mps")
 SEED = 42
 torch.manual_seed(SEED)
+
+
+def model_handler(model_type: str):
+    if model_type == "resnet":
+        model = ResNet(num_blocks=[1, 1, 1, 1], num_classes=10, block_fn="residual", dimensions=[64, 128, 256, 512], first_kernel_size=3, identity_method="B")
+        path = "models/resnet.pt"
+        loaded = torch.load(path, map_location="cpu")
+        # convert bf16 to fp32
+        for k in loaded.keys():
+            loaded[k] = loaded[k].float()
+        model.load_state_dict(loaded)
+        model.eval()
+        return model.to(DEVICE)
+    elif model_type == "mamba":
+        model = VisionMamba(height=32, width=32, patch_size=2, dim=196, n_layers=9, n_classes=10, block_type="bi_add", pos_emb=False)
+        path = "models/vision_mamba.pt"
+        loaded = torch.load(path, map_location="cpu")
+        new_state_dict = {}
+
+        for k, v in loaded.items():
+            v = v.float()
+            if k in ["head.2.weight", "head.2.bias"]:
+                k = k.replace("head.2", "head")
+            new_state_dict[k] = v
+
+        model.load_state_dict(new_state_dict)
+        model.eval()
+        return model.to(DEVICE)
+    elif model_type == "vit":
+        model = ViT(height=32, width=32, patch_size=4, dim=256, n_layers=6, n_heads=4, mlp_factor=4, n_classes=10)
+        path = "models/vit.pt"
+        loaded = torch.load(path, map_location="cpu")
+        model.load_state_dict(loaded)
+        model.eval()
+        return model.to(DEVICE)
 
 
 def get_2_directions(model: nn.Module, verbose: bool = True) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
@@ -24,11 +66,10 @@ def get_2_directions(model: nn.Module, verbose: bool = True) -> Tuple[Dict[str, 
     for i, (name, param) in enumerate(params):
         curr_x = torch.randn_like(param)
         curr_y = torch.randn_like(param)
-        if param.dim() <= 1:  # skip bias
+        if param.dim() <= 1:
             curr_x.fill_(0)
             curr_y.fill_(0)
         else:
-            # ensure the norm of the direction is the same as the norm of the parameter in this group
             curr_x.mul_(param.norm() / (curr_x.norm() + 1e-10))
             curr_y.mul_(param.norm() / (curr_y.norm() + 1e-10))
         dx[name] = curr_x
@@ -57,6 +98,7 @@ def eval_loss(model: nn.Module, criterion: nn.Module, dataloader: DataLoader) ->
     total = 0
 
     with torch.no_grad():
+        # for inputs, targets in tqdm(dataloader, desc="Evaluating"):
         for inputs, targets in dataloader:
             inputs, targets = inputs.to(DEVICE), targets.to(DEVICE)
             outputs = model(inputs)
@@ -65,8 +107,6 @@ def eval_loss(model: nn.Module, criterion: nn.Module, dataloader: DataLoader) ->
             _, predicted = outputs.max(1)
             total += targets.size(0)
             correct += predicted.eq(targets).sum().item()
-            if total > 2000:
-                break
 
     return loss_sum / total, 100.0 * correct / total
 
@@ -83,6 +123,9 @@ def crunch(
     verbose: bool = True,
 ):
     res = {}
+    # starting
+    loss, acc = eval_loss(model, criterion, trainloader)
+    print(f"Initial loss={loss:.3f} acc={acc:.2f}")
     for i, x in enumerate(x_coordinates):
         for j, y in enumerate(y_coordinates):
             new_model = set_weights(model, original_state_dict, dx, dy, x, y)
@@ -100,32 +143,33 @@ if __name__ == "__main__":
     parser.add_argument("--x", default="-1:1:10", help="A string with format xmin:x_max:xnum")
     parser.add_argument("--y", default="-1:1:10", help="A string with format ymin:ymax:ynum")
     parser.add_argument("--output_fpath", default="output.h5", help="output file path")
+    parser.add_argument("--model", default="resnet", help="model type")
     args = parser.parse_args()
     x_min, x_max, x_num = map(int, args.x.split(":"))
     y_min, y_max, y_num = map(int, args.y.split(":"))
 
-    model = load_ref().to(DEVICE)
+    model = model_handler(args.model)
     original_state_dict = copy.deepcopy(model.state_dict())
 
     dx, dy = get_2_directions(model)
 
     # download the dataset
-    trainset = torchvision.datasets.CIFAR10(
+    evalset = torchvision.datasets.CIFAR10(
         root="data/",
-        train=True,
+        train=False,
         download=True,
         transform=torchvision.transforms.Compose(
             [torchvision.transforms.ToTensor(), torchvision.transforms.Normalize(mean=[x / 255.0 for x in [125.3, 123.0, 113.9]], std=[x / 255.0 for x in [63.0, 62.1, 66.7]])]
         ),
     )
-    trainloader = DataLoader(trainset, batch_size=args.batch_size, shuffle=False)
+    evalloader = DataLoader(evalset, batch_size=args.batch_size, shuffle=False)
 
     ############## CRUNCH FUNCTION ################
     x_coordinates = torch.linspace(x_min, x_max, x_num)
     y_coordinates = torch.linspace(y_min, y_max, y_num)
 
     criterion = nn.CrossEntropyLoss()
-    res = crunch(model, original_state_dict, x_coordinates, y_coordinates, dx, dy, criterion, trainloader)
+    res = crunch(model, original_state_dict, x_coordinates, y_coordinates, dx, dy, criterion, evalloader)
 
     # save the results to the surface file
     with h5py.File(args.output_fpath, "w") as f:

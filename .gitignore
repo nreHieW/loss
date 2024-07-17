@@ -2,3 +2,8 @@ reference/
 data/
 *.ipynb
 __pycache__/
+*.pt
+*.h5
+lm_shakespeare/
+*.gif
+*.png
